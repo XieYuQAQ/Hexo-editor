@@ -1,7 +1,8 @@
 # Hexo 文章编辑器
 
-纯前端（无后端、无构建、无依赖安装）的 Markdown 文章编辑器，直接读写本项目的
-`source/_posts`，格式与站内已有文章完全一致。
+**这是由Deepseek flash v4.1进行编写的文章编辑器。**
+
+纯前端（无后端、无构建、无依赖安装）的 Markdown 文章编辑器，直接读写本项目Hexo博客的`source/_posts`，格式与ZEROKAMI站内已有文章完全一致。**因此本项目可能在图片路径、视频块使用等方面与各位的Hexo博客有着较大差异，可能并不适用于你的Hexo博客**。
 
 ```
 hexo-editor/
@@ -16,6 +17,12 @@ hexo-editor/
 ---
 
 ## 一、怎么打开
+
+### 在线使用
+
+本项目已经上传至Github仓库，可直接使用 https://xieyuqaq.github.io/Hexo-editor/。如果你所处的地方对Github访问并不友好，也可以从https://zerokami.cn/tools/hexo-editor上进行访问。
+
+### 下载使用
 
 **双击 `index.html`**，用 Chrome / Edge 打开（Firefox / Safari 没有 File System
 Access API，只能「导入文件夹」只读编辑 + 下载，见下方说明）。
