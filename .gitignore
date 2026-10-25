@@ -1,0 +1,14 @@
+# 依赖与构建产物
+node_modules/
+
+# 本地工作区数据（不进仓库）
+.workbuddy/
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+*.log
+
+# 测试临时探针 / 截图（正式测试文件为 *.test.mjs，不受影响）
+test/_shots/
+test/_*.mjs
