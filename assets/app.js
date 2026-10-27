@@ -185,7 +185,8 @@
     posts: [],              // { id, path, name, doc, raw, handle, dirty, savedOnce }
     current: null,
     filter: { q: '', tags: [], dirtyOnly: false, sort: 'date-desc' },
-    imageCache: new Map()
+    imageCache: new Map(),
+    imgSize: new Map()      // path -> { w, h }：上次加载后的实际渲染尺寸，重建时用来占位，避免图片重新加载时高度塌陷
   };
 
   var hasFSA = typeof window.showDirectoryPicker === 'function';
@@ -324,6 +325,7 @@
       state.imagesDir = dir;
       state.hasImages = true;
       state.imageCache.clear();
+      state.imgSize.clear();
       await idb.set('images', dir);
       updateModeUI();
       updateCoverPreview();
@@ -995,12 +997,23 @@
     'g'
   );
 
-  /** 图片预览节点：<img> 的 textContent 恒为空串，不影响读回原文 */
+  /**
+   * 图片预览节点：<img> 的 textContent 恒为空串，不影响读回原文。
+   * 重建（renderBody 会整段 innerHTML = ''）时图片是全新节点、还没 src，
+   * 若不预占位就会从 300px 塌到 18px，加载完再弹回去，把下方内容顶下去
+   * —— 表现就是「插入图片后粘贴文字，页面往下跳一段」。
+   * 所以这里用上次加载后记下的尺寸先撑住，加载完再把内联尺寸交还给 CSS。
+   */
   function imgNode(src) {
     var img = document.createElement('img');
     img.className = 'ed-img';
     img.setAttribute('data-src', String(src || ''));
     img.alt = '';
+    var size = state.imgSize.get(String(src || ''));
+    if (size && size.h > 0) {
+      img.style.minHeight = size.h + 'px';
+      if (size.w > 0) img.style.width = size.w + 'px';
+    }
     return img;
   }
 
@@ -1019,8 +1032,15 @@
       Promise.resolve(resolveImageUrl(src)).then(function (url) {
         if (!url || !img.isConnected) { markImgBad(img); return; }
         img.addEventListener('load', function () {
-          if (!img.naturalWidth) markImgBad(img);
-          else img.classList.add('ok');
+          if (!img.naturalWidth) { markImgBad(img); return; }
+          img.classList.add('ok');
+          // 占位用的内联尺寸交还给 CSS，再记录真实渲染尺寸（供下次重建占位）
+          img.style.minHeight = '';
+          img.style.width = '';
+          var r = img.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) {
+            state.imgSize.set(String(src), { w: Math.round(r.width), h: Math.round(r.height) });
+          }
         }, { once: true });
         img.addEventListener('error', function () { markImgBad(img); }, { once: true });
         img.src = url;
@@ -1031,6 +1051,9 @@
   /** 图加载不出来时退回原来的「🖼 alt」小徽标，别让人对着一片空白 */
   function markImgBad(img) {
     img.classList.add('bad');
+    // 清掉占位尺寸：图都坏了就别再撑着一大片空白
+    img.style.minHeight = '';
+    img.style.width = '';
     var prev = img.previousElementSibling;
     if (prev && prev.getAttribute && prev.getAttribute('data-i') === 'img') {
       prev.classList.add('show-fallback');
