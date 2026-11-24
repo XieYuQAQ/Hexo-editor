@@ -1,3 +1,4 @@
+import { findPostsDir, waitForBoot } from './helpers.mjs';
 // 格式层回归测试：对 source/_posts 下全部 .md 做「解析 → 序列化 → 逐字节比对」
 // 用法：node hexo-editor/test/roundtrip.test.mjs
 import fs from 'node:fs';
@@ -9,7 +10,8 @@ const require = createRequire(import.meta.url);
 const Core = require('../assets/core.js');
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const postsDir = path.resolve(here, '../../source/_posts');
+
+const postsDir = findPostsDir(here);
 
 let pass = 0;
 const failures = [];

@@ -1,3 +1,4 @@
+import { findPostsDir, pickPost, waitForBoot } from './helpers.mjs';
 // 端到端写盘测试：用内存里的假 File System Access API 模拟真实浏览器，
 // 验证「打开目录 → 选文章 → 改字段 → 保存 → 文件内容变化」整条链路。
 // 用法：node hexo-editor/test/fs-e2e.test.mjs
@@ -7,11 +8,12 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { JSDOM } = require('D:/ZEROKAMI/node_modules/jsdom');
+const { JSDOM } = require('jsdom');
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const editorDir = path.resolve(here, '..');
-const postsDir = path.resolve(here, '../../source/_posts');
+
+const postsDir = findPostsDir(here);
 
 // 第 8 / 10 组用到的两篇最小样例（占位 abbrlink 用纯字母，避免被当成时间戳之类）
 const sampleA = [
@@ -145,7 +147,7 @@ w.indexedDB = undefined;
 for (const file of ['core.js', 'app.js']) {
   w.eval(fs.readFileSync(path.join(editorDir, 'assets', file), 'utf8'));
 }
-d.dispatchEvent(new w.Event('DOMContentLoaded'));
+await waitForBoot(dom);
 
 const E = w.HexoEditor;
 const Core = w.HexoCore;
@@ -153,9 +155,15 @@ const Core = w.HexoCore;
 /* ================================================================
  * 1. 目录自动识别：项目根 → source/_posts
  * ================================================================ */
+const postA = pickPost(postsDir, (raw) =>
+  /^title: \S/m.test(raw) && /^abbrlink: \S/m.test(raw) &&
+  /^date: \S/m.test(raw) && /^cover: \S/m.test(raw), '字段齐全的文章');
+const postB = pickPost(postsDir, (raw, name) => name !== postA.name && /^title: \S/m.test(raw), '另一篇文章');
+const titleA = String(Core.get(Core.parsePost(postA.raw), 'title'));
+
 const proj = buildFakeProject();
-proj.posts._files.set('25 迈从G3 A鼠标开箱.md', fs.readFileSync(path.join(postsDir, '25 迈从G3 A鼠标开箱.md'), 'utf8'));
-proj.posts._files.set('26 半高SATA硬盘盒开箱.md', fs.readFileSync(path.join(postsDir, '26 半高SATA硬盘盒开箱.md'), 'utf8'));
+proj.posts._files.set(postA.name, postA.raw);
+proj.posts._files.set(postB.name, postB.raw);
 
 await E.fs.attach(proj.root);
 check(E.state.mode === 'fs', '进入 fs 模式');
@@ -175,12 +183,12 @@ check(!d.querySelector('#app').classList.contains('collapsed'), '没选文章时
 /* ================================================================
  * 2. 打开文章 → 改字段 → 保存回假磁盘
  * ================================================================ */
-const p = E.state.posts.find((x) => x.name.includes('迈从G3'));
+const p = E.state.posts.find((x) => x.name === postA.name);
 check(!!p, '找到目标文章');
 E.openPost(p, { skipDraftCheck: true });
 
 const titleInput = d.querySelector('#f-title');
-titleInput.value = '迈从G3 A鼠标开箱（E2E）';
+titleInput.value = titleA + '（E2E）';
 titleInput.dispatchEvent(new w.Event('input', { bubbles: true }));
 check(p.dirty === true, '改标题后 dirty');
 
@@ -192,14 +200,14 @@ E.addTag('端到端');
 
 await E.savePost({ force: true });
 
-const saved = proj.posts._files.get('25 迈从G3 A鼠标开箱.md');
+const saved = proj.posts._files.get(postA.name);
 check(!!saved, '文件已写回');
-check(saved.includes('title: 迈从G3 A鼠标开箱（E2E）'), '磁盘上标题已更新');
+check(String(Core.get(Core.parsePost(saved), 'title')) === titleA + '（E2E）', '磁盘上标题已更新', Core.get(Core.parsePost(saved), 'title'));
 check(saved.includes('cover: /images/2025/09/new-cover.jpg'), '磁盘上封面已更新');
 check(saved.includes('端到端'), '磁盘上标签已更新');
 
 /* 其它字段必须保持原样 */
-const original = fs.readFileSync(path.join(postsDir, '25 迈从G3 A鼠标开箱.md'), 'utf8');
+const original = postA.raw;
 const origFm = Core.splitFront(original).front.filter((l) => /^(abbrlink|date):/.test(l));
 const newFm = Core.splitFront(saved).front.filter((l) => /^(abbrlink|date):/.test(l));
 check(JSON.stringify(origFm) === JSON.stringify(newFm), 'abbrlink / date 未被改动', newFm.join(' | '));
@@ -217,7 +225,7 @@ const dateInput = d.querySelector('#f-date');
 dateInput.value = '2025-09-29 08:30:00';
 dateInput.dispatchEvent(new w.Event('input', { bubbles: true }));
 await E.savePost({ force: true });
-const saved2 = proj.posts._files.get('25 迈从G3 A鼠标开箱.md');
+const saved2 = proj.posts._files.get(postA.name);
 check(saved2.includes('date: 2025-09-29 08:30:00'), '日期修改已落盘', saved2.split('\n').find((l) => l.startsWith('date:')));
 
 /* ================================================================
@@ -364,6 +372,8 @@ check(proj.images._dirs.get('2026')._dirs.get('01')._files.size === 2, '两张�
   const proj3 = buildFakeProject();
   proj3.posts._files.set('B.md', sampleB);
   E.state.imagesDir = new FakeDirHandle('images');
+  E.state.imagesSource = 'manual';
+  E.state.imagesScope = null;
   E.state.hasImages = true;
   await E.fs.attach(proj3.posts);
   check(E.state.hasImages === true, '重新打开文章目录后图片连接保留');

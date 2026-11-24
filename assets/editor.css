@@ -985,10 +985,22 @@ img.ed-img.bad { display: none; }
   #app { grid-template-columns: 250px 1fr; }
   .ed-body { grid-template-columns: 270px 1fr; }
 }
+#btn-mobile-props { display: none; }
+.conflict-text { max-height: 12rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 860px) {
-  #app { grid-template-columns: 1fr; }
-  #sidebar { display: none; }
-  #sidebar.show { display: flex; position: fixed; inset: 0 auto 0 0; width: 300px; z-index: 50; }
-  .ed-body { grid-template-columns: 1fr; }
-  .props { position: fixed; inset: 0 0 0 0; z-index: 40; }
+  #app, #app.collapsed {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 40%) minmax(0, 1fr);
+    height: 100dvh;
+  }
+  #app.collapsed { grid-template-rows: 0 minmax(0, 1fr); }
+  #sidebar { border-bottom: 1px solid var(--line); }
+  .ed-head { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 8px; }
+  .ed-center { flex: 1; }
+  #file-name { width: 100%; }
+  .ed-actions { flex-wrap: wrap; }
+  #btn-mobile-props { display: inline-block; }
+  .ed-body, .ed-body.no-props { grid-template-columns: minmax(0, 1fr); }
+  .ed-body .props, .ed-body.mobile-props .md { display: none; }
+  .ed-body.mobile-props .props { display: flex; }
 }

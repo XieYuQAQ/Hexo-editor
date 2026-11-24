@@ -1,3 +1,4 @@
+import { findPostsDir, pickPost, waitForBoot } from './helpers.mjs';
 // 编辑语义测试：改单个字段时，输出与原文的差异必须只落在该字段上
 // 用法：node hexo-editor/test/edit.test.mjs
 import fs from 'node:fs';
@@ -10,7 +11,8 @@ const require = createRequire(import.meta.url);
 const Core = require('../assets/core.js');
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const postsDir = path.resolve(here, '../../source/_posts');
+
+const postsDir = findPostsDir(here);
 
 let checks = 0;
 let failed = 0;
@@ -35,13 +37,13 @@ function lineFor(text, key) {
 
 /* ---------- 1. 改 title ---------- */
 {
-  const name = '25 迈从G3 A鼠标开箱.md';
-  const raw = fs.readFileSync(path.join(postsDir, name), 'utf8');
+  const sample = pickPost(postsDir, null, '任意一篇文章');
+  const raw = sample.raw;
   const doc = Core.parsePost(raw);
-  Core.set(doc, 'title', '迈从G3 A鼠标开箱（改名测试）');
+  Core.set(doc, 'title', '示例标题（改名测试）');
   const out = Core.stringifyPost(doc);
   check(lineFor(out, 'title').length === 1, 'title 只输出一行');
-  check(lineFor(out, 'title')[0] === 'title: 迈从G3 A鼠标开箱（改名测试）', 'title 内容正确', lineFor(out, 'title')[0]);
+  check(lineFor(out, 'title')[0] === 'title: 示例标题（改名测试）', 'title 内容正确', lineFor(out, 'title')[0]);
   check(bodyOf(out) === bodyOf(raw), 'title 改动不影响正文');
   check(fmLines(out).length === fmLines(raw).length, 'title 改动不增减 front matter 行数');
   // 其它行逐行不变
@@ -52,8 +54,8 @@ function lineFor(text, key) {
 
 /* ---------- 2. 改 tags ---------- */
 {
-  const name = '26 半高SATA硬盘盒开箱.md';
-  const raw = fs.readFileSync(path.join(postsDir, name), 'utf8');
+  const sample = pickPost(postsDir, (raw) => /^tags: \[[^\]]*\S[^\]]*\]/m.test(raw), '含内联标签的文章');
+  const raw = sample.raw;
   const doc = Core.parsePost(raw);
   Core.set(doc, 'tags', ['硬件', '生活', 'DIY']);
   const out = Core.stringifyPost(doc);
@@ -64,8 +66,8 @@ function lineFor(text, key) {
 
 /* ---------- 3. 改 description：单行 -> 多行 -> 单行 ---------- */
 {
-  const name = '26 半高SATA硬盘盒开箱.md';
-  const doc = Core.parsePost(fs.readFileSync(path.join(postsDir, name), 'utf8'));
+  const sample = pickPost(postsDir, (raw) => /^description: (?!>|\|)\S/m.test(raw), '单行描述的文章');
+  const doc = Core.parsePost(sample.raw);
   Core.set(doc, 'description', '第一段\n第二段');
   const out = Core.stringifyPost(doc);
   const lines = lineFor(out, 'description');
@@ -81,8 +83,8 @@ function lineFor(text, key) {
 
 /* ---------- 4. cover：清空 / 设置 ---------- */
 {
-  const name = '26 半高SATA硬盘盒开箱.md';
-  const raw = fs.readFileSync(path.join(postsDir, name), 'utf8');
+  const sample = pickPost(postsDir, (raw) => /^cover: \S/m.test(raw), '有封面的文章');
+  const raw = sample.raw;
   const doc = Core.parsePost(raw);
   Core.set(doc, 'cover', '');
   check(lineFor(Core.stringifyPost(doc), 'cover')[0] === 'cover: ', '清空 cover 输出 "cover: "');
@@ -95,9 +97,11 @@ function lineFor(text, key) {
 
 /* ---------- 5. abbrlink 放行 ---------- */
 {
-  const raw = fs.readFileSync(path.join(postsDir, '26 MiMo V2.5 ASR 视频、音频转字幕工具.md'), 'utf8');
+  const sample = pickPost(postsDir, (raw) => /^abbrlink: \S/m.test(raw), '有 abbrlink 的文章');
+  const raw = sample.raw;
   const doc = Core.parsePost(raw);
-  check(Core.get(doc, 'abbrlink') === 'd02421ae', '读到 abbrlink');
+  const abbr = (/^abbrlink: (\S+)/m.exec(raw) || [])[1];
+  check(Core.get(doc, 'abbrlink') === abbr, '读到 abbrlink', Core.get(doc, 'abbrlink'));
   Core.set(doc, 'abbrlink', 'deadbeef');
   check(lineFor(Core.stringifyPost(doc), 'abbrlink')[0] === 'abbrlink: deadbeef', '写入 abbrlink');
 }
@@ -116,7 +120,7 @@ function lineFor(text, key) {
   check(/^date: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(fmLines(out)[4]), '新文章 date 格式', fmLines(out)[4]);
   check(fmLines(out)[5] === 'cover: ', '新文章空 cover 输出 "cover: "', fmLines(out)[5]);
   // 生成的文件必须能被 Hexo 的 js-yaml 解析
-  const yaml = require('D:/ZEROKAMI/node_modules/js-yaml');
+  const yaml = require('js-yaml');
   const parsed = yaml.load(fmLines(out).join('\n'));
   check(parsed.title === '测试标题', 'js-yaml 解析 title');
   check(JSON.stringify(parsed.tags) === JSON.stringify(['测试', '网站']), 'js-yaml 解析 tags');
@@ -136,7 +140,7 @@ function lineFor(text, key) {
     '@at 开头',
     'a & b'
   ];
-  const yaml = require('D:/ZEROKAMI/node_modules/js-yaml');
+  const yaml = require('js-yaml');
   const doc = Core.createPost();
   for (const t of tricky) {
     Core.set(doc, 'title', t);
@@ -158,7 +162,7 @@ function lineFor(text, key) {
 /* ---------- 8. abbrlink 算法 ---------- */
 {
   // 与 node_modules/hexo-abbrlink/lib/crc32.js 的 crc32.str 对齐
-  const crc32lib = require('D:/ZEROKAMI/node_modules/hexo-abbrlink/lib/crc32.js');
+  const crc32lib = require('hexo-abbrlink/lib/crc32.js');
   const samples = ['测试', 'こんにちは', 'Star night snow', '🎉 emoji', ''];
   for (const s of samples) {
     const a = (crc32lib.str(s) >>> 0).toString(16);
@@ -169,7 +173,7 @@ function lineFor(text, key) {
 
 /* ---------- 9. 文件名 ---------- */
 {
-  check(Core.suggestFilename('迈从G3 A鼠标开箱', '2026-10-25 12:00:00', 'yy') === '26 迈从G3 A鼠标开箱.md', 'yy 前缀');
+  check(Core.suggestFilename('示例标题', '2026-10-25 12:00:00', 'yy') === '26 示例标题.md', 'yy 前缀');
   check(Core.suggestFilename('测试', '2026-10-25 12:00:00', 'yymm') === '2610 测试.md', 'yymm 前缀');
   check(Core.suggestFilename('a/b:c*d?', '2026-10-25 12:00:00', 'none') === 'abcd.md', '非法字符过滤', Core.suggestFilename('a/b:c*d?', '2026-10-25 12:00:00', 'none'));
   check(Core.suggestFilename('  ', '2026-10-25 12:00:00', 'none') === 'untitled.md', '空标题兜底');
@@ -182,10 +186,12 @@ function lineFor(text, key) {
     youtube: 'https://youtu.be/bI5YOkr5-Lc',
     style: 'padded'
   });
-  check(block === `<div id="videoContainer">
+  const containerId = block.match(/<div id="([^"]+)"/)[1];
+  check(block === `<div id="${containerId}">
   <p>请稍等，正在根据您的网络加载播放器……</p>
 </div>
 <script>
+(function(container) {
   function loadBilibiliVideo() {
       const videoHtml = \`<div style="position: relative; padding: 30% 45%;"><iframe style="position: absolute; width: 100%; height: 100%; left: 0; top: 0;" src="https://player.bilibili.com/player.html?bvid=BV1CibC6BEdT&page=1&high_quality=1&danmaku=0" frameborder="no" scrolling="no"></iframe></div><br>\`;
       return videoHtml;}
@@ -194,12 +200,13 @@ function lineFor(text, key) {
       return videoHtml;}
   checkGoogle().then(function(status) {
   if (status === 0) {
-        document.getElementById("videoContainer").innerHTML = loadBilibiliVideo();
+        container.innerHTML = loadBilibiliVideo();
   } else {
-        document.getElementById("videoContainer").innerHTML = loadYouTubeVideo();
+        container.innerHTML = loadYouTubeVideo();
     }
   });
-</script>`, '视频块模板与语料一致', block.split('\n').slice(0, 6).join('\n'));
+})(document.currentScript ? document.currentScript.previousElementSibling : document.getElementById("${containerId}"));
+</script>`, '视频块隔离容器与播放器模板', block.split('\n').slice(0, 6).join('\n'));
 
   // 语料中 aid+cid 的写法必须能复现
   const old = Core.buildVideoBlock({ aid: '32664783113', cid: '32664783113', youtube: 'wqqqpAodDvg', style: 'simple' });
@@ -222,7 +229,7 @@ function lineFor(text, key) {
   // auto 默认 true：仍与语料一致（判断网络）
   const autoDefault = Core.buildVideoBlock({ bvid: 'BV1CibC6BEdT', youtube: 'bI5YOkr5-Lc' });
   check(autoDefault.includes('checkGoogle()'), '默认 auto=true 仍含 checkGoogle');
-  check(autoDefault.includes('<div id="videoContainer">'), '默认 auto=true 含视频容器');
+  check(/<div id="videoContainer-[^"]+">/.test(autoDefault), '默认 auto=true 含视频容器');
 
   check(Core.normalizeYoutubeId('https://www.youtube.com/watch?v=GblT7c9B-24&t=1') === 'GblT7c9B-24', 'YT 从 watch 链接取 id');
   check(Core.normalizeYoutubeId('https://youtu.be/GblT7c9B-24?si=abc') === 'GblT7c9B-24', 'YT 从短链取 id');

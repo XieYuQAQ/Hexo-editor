@@ -48,11 +48,13 @@
 
   function debounce(fn, wait) {
     var h = null;
-    return function () {
+    var run = function () {
       var args = arguments, self = this;
       clearTimeout(h);
       h = setTimeout(function () { fn.apply(self, args); }, wait);
     };
+    run.cancel = function () { clearTimeout(h); h = null; };
+    return run;
   }
 
   /** 简单确认 / 表单弹窗 */
@@ -178,6 +180,10 @@
     root: null,             // 项目根目录 handle
     postsDir: null,         // source/_posts handle
     imagesDir: null,        // source/images handle
+    imagesSource: 'auto',
+    imagesScope: null,
+    imagesVersion: 0,
+    projectId: 'demo',
     hasImages: false,
     rootRemembered: null,   // 记得住但还没授权的文章目录 handle
     imagesRemembered: null, // 记得住但还没授权的图片目录 handle
@@ -208,6 +214,56 @@
   function fileExt(name) {
     var m = /\.[A-Za-z0-9]+$/.exec(String(name || ''));
     return m ? m[0] : '.jpg';
+  }
+
+  var projectHandles = new WeakMap();
+  async function identifyProject(handle) {
+    if (projectHandles.has(handle)) return projectHandles.get(handle);
+    var projects = await idb.get('projects') || [];
+    for (var i = 0; i < projects.length; i++) {
+      try {
+        if (handle === projects[i].handle || (handle.isSameEntry && await handle.isSameEntry(projects[i].handle))) {
+          projectHandles.set(handle, projects[i].id);
+          return projects[i].id;
+        }
+      } catch (e) { /* 失效句柄不能作为其他目录的身份 */ }
+    }
+    var id = uid() + '-' + Date.now().toString(36);
+    projects.push({ id: id, handle: handle });
+    await idb.set('projects', projects);
+    projectHandles.set(handle, id);
+    return id;
+  }
+
+  function resetImageCache() {
+    state.imagesVersion++;
+    state.imageCache.forEach(function (url) { URL.revokeObjectURL(url); });
+    state.imageCache.clear();
+    state.imgSize.clear();
+  }
+
+  function pathParts(path) {
+    var parts = String(path || '').split('/');
+    if (!parts.length || parts.some(function (p) { return !p || p === '.' || p === '..' || /[\\\u0000-\u001f]/.test(p); })) {
+      throw new Error('文章路径不合法');
+    }
+    return parts;
+  }
+
+  async function readPostFile(file) {
+    // File.text() 会丢掉 BOM。仅在存在 BOM 时补回它，正文仍由浏览器解码。
+    var text = await file.text();
+    if (file.slice && file.arrayBuffer) {
+      var prefix = new Uint8Array(await file.slice(0, 3).arrayBuffer());
+      if (prefix[0] === 0xef && prefix[1] === 0xbb && prefix[2] === 0xbf) text = '\uFEFF' + text;
+    }
+    return text;
+  }
+
+  function siblingPath(p, name) {
+    var path = p.path || p.name;
+    var slash = path.lastIndexOf('/');
+    return (slash < 0 ? '' : path.slice(0, slash + 1)) + name;
   }
 
   /* ================================================================
@@ -271,13 +327,20 @@
 
       if (!postsDir) throw new Error('这个目录里没找到 source/_posts，也没有 .md 文件');
 
+      commitCurrentDraft();
+      var projectId = await identifyProject(postsDir);
+      var keepManualImages = state.imagesSource === 'manual' &&
+        (!state.imagesScope || state.imagesScope === projectId);
       state.mode = 'fs';
+      state.projectId = projectId;
       state.root = root;
       state.postsDir = postsDir;
-      // 用户如果之前单独连过图片目录，就不要被这次识别覆盖掉
-      if (!state.imagesDir) {
+      if (!keepManualImages) {
         state.imagesDir = imagesDir;
+        state.imagesSource = 'auto';
       }
+      state.imagesScope = projectId;
+      resetImageCache();
       state.hasImages = !!state.imagesDir;
       state.dirName = root ? root.name : postsDir.name;
       state.posts = [];
@@ -323,10 +386,12 @@
       }
 
       state.imagesDir = dir;
+      state.imagesSource = 'manual';
+      state.imagesScope = state.mode === 'fs' ? state.projectId : null;
       state.hasImages = true;
-      state.imageCache.clear();
-      state.imgSize.clear();
+      resetImageCache();
       await idb.set('images', dir);
+      await idb.set('imagesScope', state.imagesScope);
       updateModeUI();
       updateCoverPreview();
       return true;
@@ -345,6 +410,7 @@
 
     async loadAll() {
       var list = [];
+      var previous = state.posts.slice();
       async function walk(dir, prefix) {
         for await (var entry of dir.values()) {
           if (entry.kind === 'directory') {
@@ -355,7 +421,7 @@
           if (/^_/.test(entry.name) && !prefix) continue;
           try {
             var file = await entry.getFile();
-            var raw = await file.text();
+            var raw = await readPostFile(file);
             var doc = Core.parsePost(raw);
             list.push({
               id: uid(),
@@ -366,7 +432,8 @@
               raw: raw,
               dirty: false,
               savedOnce: true,
-              mtime: file.lastModified
+              mtime: file.lastModified,
+              projectId: state.projectId
             });
           } catch (e) {
             console.warn('读取失败', entry.name, e);
@@ -374,7 +441,20 @@
         }
       }
       await walk(state.postsDir, '');
+      list = list.map(function (disk) {
+        var memory = previous.find(function (p) { return p.path === disk.path && !p.isNew; });
+        if (!memory) return disk;
+        memory.handle = disk.handle;
+        if (!memory.dirty) memory.raw = disk.raw;
+        memory.mtime = disk.mtime;
+        if (!memory.dirty) memory.doc = disk.doc;
+        return memory;
+      });
+      previous.forEach(function (p) {
+        if (p.dirty && !list.some(function (x) { return x.path === p.path; })) list.push(p);
+      });
       state.posts = list;
+      discoverDrafts();
       FS.reindex();
     },
 
@@ -394,9 +474,19 @@
       toast('当前是导入模式，请重新选择文件夹');
     },
 
+    async parent(dir, path) {
+      var parts = pathParts(path);
+      var name = parts.pop();
+      for (var i = 0; i < parts.length; i++) dir = await dir.getDirectoryHandle(parts[i]);
+      return { dir: dir, name: name };
+    },
+
     async write(handleOrDir, name, text) {
       var fh = handleOrDir;
-      if (fh.kind !== 'file') fh = await handleOrDir.getFileHandle(name, { create: true });
+      if (fh.kind !== 'file') {
+        var target = await FS.parent(handleOrDir, name);
+        fh = await target.dir.getFileHandle(target.name, { create: true });
+      }
       var w = await fh.createWritable();
       // 直接写字符串：createWritable().write() 接受字符串，比包 Blob 更省事也更兼容
       await w.write(text);
@@ -404,8 +494,9 @@
       return fh;
     },
 
-    async remove(name) {
-      await state.postsDir.removeEntry(name);
+    async remove(path, baseDir) {
+      var target = await FS.parent(baseDir || state.postsDir, path);
+      await target.dir.removeEntry(target.name);
     },
 
     async readImage(relPath) {
@@ -565,6 +656,8 @@
   }
 
   function closeEditor() {
+    commitCurrentDraft();
+    scheduleHistory.cancel();
     state.current = null;
     state.sidebarCollapsed = false;
     renderList();
@@ -573,12 +666,16 @@
 
   function openPost(p, opts) {
     opts = opts || {};
-    commitCurrentDraft();
+    if (!opts.skipDraftCommit) commitCurrentDraft();
+    scheduleHistory.cancel();
     state.current = p;
+    $('.ed-body').classList.remove('mobile-props');
+    $('#btn-mobile-props').setAttribute('aria-expanded','false');
+    $('#btn-mobile-props').textContent = '属性';
     suppress = true;
     $('#empty').classList.add('hidden');
     $('#editor').classList.remove('hidden');
-    form.fileName.value = p.name;
+    form.fileName.value = p.pendingName || p.name;
     form.title.value = String(Core.get(p.doc, 'title') || '');
     form.abbrlink.value = String(Core.get(p.doc, 'abbrlink') || '');
     form.description.value = String(Core.get(p.doc, 'description') || '');
@@ -650,6 +747,7 @@
 
   function setField(key, value) {
     if (!state.current) return;
+    if (JSON.stringify(Core.get(state.current.doc, key)) === JSON.stringify(value)) return;
     Core.set(state.current.doc, key, value);
     markDirty();
   }
@@ -705,7 +803,10 @@
   }
 
   /* ---- cover ---- */
+  var coverRequest = 0;
   function updateCoverPreview() {
+    var request = ++coverRequest;
+    var post = state.current;
     var box = $('#cover-preview');
     var path = String(form.cover.value || '').trim();
     if (!path) {
@@ -716,6 +817,7 @@
     }
     box.textContent = '加载中…';
     resolveImageUrl(path).then(function (url) {
+      if (request !== coverRequest || state.current !== post || form.cover.value.trim() !== path) return;
       if (!url) {
         box.textContent = '无法预览';
         box.classList.remove('has-img');
@@ -733,7 +835,7 @@
    * 三种来源，按优先级：
    *   1) 已连接 images 目录 → 读文件做 blob URL（最可靠，任何协议都行）
    *   2) http(s) 环境 → 直接用 /images/... 交给服务器映射
-   *   3) file:// 且没连目录 → 用相对路径 ../source/images/... 直接读文件系统
+   *   3) file:// 且没连目录 → 用相对路径 ../../source/images/... 直接读文件系统
    */
   function resolveImageUrl(path) {
     if (!path) return Promise.resolve('');
@@ -745,16 +847,18 @@
     function viaRelative() {
       if (location.protocol !== 'file:') return null;
       // file:// 下浏览器允许直接读同源文件；编辑器在 hexo-editor/，图片在 ../source/images/
-      return '../source' + path;
+      return '../../source' + path;
     }
 
     if (!state.hasImages) {
       var rel = viaRelative();
       return Promise.resolve(rel || (location.protocol === 'file:' ? '' : path));
     }
+    var version = state.imagesVersion;
     return FS.readImage(path).then(function (file) {
       if (!file) return viaRelative() || (location.protocol === 'file:' ? '' : path);
       var url = URL.createObjectURL(file);
+      if (version !== state.imagesVersion) { URL.revokeObjectURL(url); return ''; }
       state.imageCache.set(path, url);
       return url;
     }).catch(function () {
@@ -1366,6 +1470,11 @@
   }
 
   function jumpHistory(dir) {
+    scheduleHistory.cancel();
+    if (hist[histIdx] && hist[histIdx].text !== bodyText()) {
+      pushHistory();
+      if (dir > 0) return;
+    }
     var next = histIdx + dir;
     if (next < 0 || next >= hist.length) return;
     histIdx = next;
@@ -1531,13 +1640,16 @@
     var info = selInfo() || { a: lastAbs, b: lastAbs };
     var v = bodyText();
     var sel = v.slice(info.a, info.b) || '脚注内容';
-    var n = (v.match(/\[\^\d+\]/g) || []).length + 1;
+    var used = new Set(v.match(/\[\^\d+\]/g) || []);
+    var n = 1;
+    while (used.has('[^' + n + ']')) n++;
     wrap('[^' + n + ']', '', '');
     insertBlock('[^' + n + ']: ' + sel);
   }
 
   /** 从本地选一张图 → 复制进 source/images → 插入 markdown */
   async function pickBodyImage() {
+    var owner = state.current;
     var input = el('input', { type: 'file', accept: 'image/*', style: 'display:none' });
     document.body.appendChild(input);
     input.onchange = async function () {
@@ -1545,7 +1657,7 @@
       input.remove();
       if (!file) return;
       var path = await importImage(file);
-      if (!path) return;
+      if (!path || state.current !== owner) return;
       // 光标落到图片行之后 → 这一行立即变成渲染态，图片马上看得见
       insertBlock('![](' + path + ')', true);
     };
@@ -1681,7 +1793,7 @@
     updateStats();
     updateCursor();
     scheduleDraft();
-    scheduleHistory();
+    if (!keepHistory) scheduleHistory();
   }
 
   /* ---------------- 正文编辑行为（回车 / 退格 / 粘贴 / 组字） ---------------- */
@@ -1806,15 +1918,27 @@
   /* ================================================================
    * 11. 草稿（localStorage）
    * ================================================================ */
-  function draftKey(p) { return 'hexo-editor:draft:' + p.path; }
+  function draftPrefix() { return 'hexo-editor:draft:v2:' + state.projectId + ':'; }
+  function draftKey(p) {
+    return 'hexo-editor:draft:v2:' + (p.projectId || state.projectId) + ':' + p.path;
+  }
 
-  function saveDraft() {
-    var p = state.current;
+  function saveDraft(p) {
+    p = p || state.current;
     if (!p || !p.dirty) return;
     try {
+      p.projectId = p.projectId || state.projectId;
+      if (state.current === p) p.pendingName = form.fileName.value;
       localStorage.setItem(draftKey(p), JSON.stringify({
         at: Date.now(),
-        text: Core.stringifyPost(p.doc)
+        text: Core.stringifyPost(p.doc),
+        path: p.path,
+        name: p.name,
+        pendingName: p.pendingName,
+        isNew: !!p.isNew,
+        savedOnce: !!p.savedOnce,
+        importRoot: state.mode === 'files' && p.projectId === state.projectId ? state.importRoot : undefined,
+        baseRaw: p.raw
       }));
     } catch (e) { /* 忽略配额错误 */ }
   }
@@ -1827,30 +1951,104 @@
     if (state.current && state.current.dirty) saveDraft();
   }
 
+  /** 没有磁盘文件的新稿也必须出现在文章列表中。 */
+  function discoverDrafts() {
+    try {
+      var prefix = draftPrefix();
+      Object.keys(localStorage).forEach(function (key) {
+        if (key.indexOf(prefix) !== 0) return;
+        var path = key.slice(prefix.length);
+        if (state.posts.some(function (p) { return p.path === path; })) return;
+        var saved = JSON.parse(localStorage.getItem(key));
+        if (!saved || typeof saved.text !== 'string') return;
+        var parts = pathParts(path);
+        state.posts.push({
+          id: uid(), path: path, name: parts[parts.length - 1], projectId: state.projectId,
+          pendingName: saved.pendingName,
+          doc: Core.parsePost(saved.text, { isNew: true }), raw: saved.baseRaw || '',
+          handle: null, dirty: true, savedOnce: false, isNew: true
+        });
+      });
+    } catch (e) { /* 不可用的存储不能阻止读盘 */ }
+  }
+
+  function legacyDrafts() {
+    try {
+      return Object.keys(localStorage).filter(function (key) {
+        return key.indexOf('hexo-editor:draft:') === 0 && key.indexOf('hexo-editor:draft:v2:') !== 0;
+      });
+    } catch (e) { return []; }
+  }
+
+  async function importLegacyDrafts() {
+    if (state.mode !== 'fs') { toast('请先连接这些草稿所属的文章目录', 'err'); return; }
+    var keys = legacyDrafts();
+    var ok = await openModal({
+      title: '导入旧版草稿',
+      body: '<p class="tip">旧版草稿没有记录所属项目。确认这 ' + keys.length + ' 份草稿属于当前目录「' +
+        escapeHtml(state.dirName) + '」后再导入。导入不会写入文章文件。</p>',
+      actions: [{ label: '取消', value: false }, { label: '导入到当前目录', primary: true, value: true }]
+    });
+    if (!ok) return;
+    keys.forEach(function (key) {
+      var target = draftPrefix() + key.slice('hexo-editor:draft:'.length);
+      if (localStorage.getItem(target) === null) {
+        localStorage.setItem(target, localStorage.getItem(key));
+        localStorage.removeItem(key);
+      }
+    });
+    discoverDrafts(); reindex();
+    toast('旧版草稿已导入，可在列表中打开恢复', 'ok');
+  }
+
   async function checkDraft(p) {
     var saved = null;
     try { saved = JSON.parse(localStorage.getItem(draftKey(p)) || 'null'); } catch (e) {}
     if (!saved || !saved.text) return;
-    if (saved.text === p.raw) { clearDraft(p); return; }
+    if (saved.text === p.raw && (!saved.pendingName || saved.pendingName === p.name)) { clearDraft(p); return; }
     var choice = await openModal({
       title: '发现未保存的草稿',
       body: '<p class="tip">这篇文章有一份本地草稿（' + new Date(saved.at).toLocaleString() +
-        '），比磁盘上的文件更新。要恢复吗？</p><p class="tip">草稿内容：<br><code>' +
+        '）。要恢复吗？</p>' + (saved.pendingName && saved.pendingName !== p.name
+          ? '<p>待保存文件名：<code>' + escapeHtml(saved.pendingName) + '</code></p>' : '') +
+        '<p class="tip">草稿内容：<br><code>' +
         escapeHtml(saved.text.slice(0, 260)) + (saved.text.length > 260 ? '…' : '') + '</code></p>',
       actions: [
         { label: '用磁盘上的版本', value: 'discard' },
         { label: '恢复草稿', primary: true, value: 'restore' }
       ]
     });
+    if (state.current !== p) return;
     if (choice === 'restore') {
+      if (saved.isNew === true) { p.isNew = true; p.savedOnce = false; }
+      if (state.mode === 'fs' && typeof saved.baseRaw === 'string') p.raw = saved.baseRaw;
       p.doc = Core.parsePost(saved.text, { isNew: p.isNew });
-      p.raw = saved.text;
-      p.savedOnce = true;
+      p.pendingName = saved.pendingName || p.pendingName;
       var keepDirty = true;
-      openPost(p, { keepDirty: keepDirty });
+      openPost(p, { keepDirty: keepDirty, skipDraftCheck: true, skipDraftCommit: true });
       toast('已恢复草稿，记得保存', 'ok');
-    } else {
+    } else if (choice === 'discard') {
+      if (p.handle) {
+        try {
+          var file = await p.handle.getFile();
+          var diskText = await readPostFile(file);
+          if (state.current !== p) return;
+          p.raw = diskText;
+        } catch (e) { toast('读取磁盘版本失败，草稿已保留：' + e.message, 'err'); return; }
+      }
       clearDraft(p);
+      if (p.isNew && !p.raw) {
+        state.posts = state.posts.filter(function (x) { return x !== p; });
+        p.dirty = false;
+        if (state.current === p) closeEditor();
+      } else {
+        p.doc = Core.parsePost(p.raw);
+        p.isNew = false;
+        p.savedOnce = true;
+        p.dirty = false;
+        p.pendingName = null;
+        if (state.current === p) openPost(p, { skipDraftCheck: true, skipDraftCommit: true });
+      }
     }
   }
 
@@ -1861,74 +2059,194 @@
     return Core.stringifyPost(state.current.doc);
   }
 
+  function linkFor(doc) {
+    return String(Core.get(doc, 'abbrlink') || Core.predictAbbrlink(Core.get(doc, 'title'))).toLowerCase();
+  }
+
+  function independentCopy(text) {
+    var doc = Core.parsePost(text, { isNew: true });
+    var base = String(Core.get(doc, 'title')).trim() + ' 副本';
+    var usedLinks = new Set(state.posts.map(function (p) { return linkFor(p.doc); }));
+    var titles = new Set(state.posts.map(function (p) { return Core.get(p.doc, 'title'); }));
+    var title = base, n = 2;
+    while (titles.has(title) || usedLinks.has(Core.predictAbbrlink(title))) title = base + ' (' + n++ + ')';
+    Core.set(doc, 'title', title);
+    Core.set(doc, 'abbrlink', '');
+    return doc;
+  }
+
+  async function diskTextAt(dir, path) {
+    var target = await FS.parent(dir, path);
+    try {
+      var handle = await target.dir.getFileHandle(target.name);
+      return await readPostFile(await handle.getFile());
+    } catch (e) {
+      if (e.name === 'NotFoundError' || /^NotFoundError/.test(e.message || '')) return null;
+      throw e;
+    }
+  }
+
+  async function confirmDiskChange(source, disk, text) {
+    var body = el('div', {}, [el('p', {text: disk === null
+      ? '原文件已被移除。可以保留草稿、下载副本，或重新创建文件。'
+      : '磁盘上的文章已被其他程序修改。请核对两个版本，再决定如何保存。'})]);
+    [['当前磁盘版本', disk], ['本次保存内容', text]].forEach(function (entry) {
+      body.appendChild(el('details', {}, [el('summary', {text: entry[0]}),
+        el('pre', {class: 'conflict-text', text: entry[1] === null ? '文件不存在' : entry[1]})]));
+    });
+    var decision = await openModal({title: '文章在磁盘上已变更', body: body, enterConfirm: false, actions: [
+      {label: '保留编辑稿', primary: true, value: 'cancel'}, {label: '下载编辑稿副本', value: 'copy'},
+      {label: disk === null ? '重新创建' : '确认覆盖磁盘版本', danger: true, value: 'overwrite'}
+    ]});
+    if (decision === 'copy') downloadBlob(text, source.name.replace(/\.md$/i, '') + ' 编辑稿.md');
+    return decision === 'overwrite';
+  }
+
   async function savePost(opts) {
     opts = opts || {};
-    var p = state.current;
-    if (!p) return;
+    var source = state.current;
+    if (!source || source.saving) return;
     var issues = validateAndShow();
     var errors = (issues || []).filter(function (i) { return i.level === 'error'; });
     if (errors.length && !opts.force) {
-      toast('请先修正：' + errors.map(function (e) { return e.message; }).join('；'), 'err');
+      // 只报第一条（完整列表已经在字段下方常驻显示），并把焦点带过去，
+      // 避免用户点了保存毫无反应、不知道哪里出了问题。
+      toast('无法保存：' + errors[0].message, 'err');
+      var fld = document.querySelector('.field.invalid input, .field.invalid textarea, input.invalid');
+      if (fld) fld.focus();
       return;
     }
 
-    var name = form.fileName.value.trim();
-    if (!name) name = Core.suggestFilename(String(Core.get(p.doc, 'title') || ''), Core.get(p.doc, 'date'), 'yy');
+    var requestedName = form.fileName.value;
+    var name = opts.name == null ? requestedName.trim() : String(opts.name).trim();
+    if (!name) {
+      name = source.isNew
+        ? Core.suggestFilename(String(Core.get(source.doc, 'title') || ''), Core.get(source.doc, 'date'), 'yy')
+        : source.name;
+    }
+    name = Core.sanitizeFilename(name);
     if (!/\.md$/i.test(name)) name += '.md';
-    name = name.replace(/[\\/:*?"<>|]/g, '').trim();
     if (!name || name === '.md') { toast('文件名不合法', 'err'); return; }
 
-    var text = currentText();
-    // p.name 始终是「磁盘上真实存在的文件名」，与输入框分开管理
-    var oldName = p.name;
-
-    if (state.mode !== 'fs') {
-      // 导入模式：下载文件
-      downloadBlob(text, name);
-      p.name = name;
-      p.path = name;
-      p.raw = text;
-      p.savedOnce = true;
-      p.dirty = false;
-      form.fileName.value = name;
-      clearDraft(p);
-      applyLocks();
-      updateDirtyUI();
-      renderList();
-      toast('已下载 ' + name + '，请放回 source/_posts', 'ok');
-      return;
-    }
-
+    var sourceText = Core.stringifyPost(source.doc);
+    var oldPath = source.path;
+    var oldKey = draftKey(source);
+    var targetPath = siblingPath(source, name);
+    if (opts.saveAs && targetPath === oldPath) { toast('另存为请使用不同的文件名', 'err'); return; }
+    var baseDir = state.postsDir;
+    var projectId = state.projectId;
+    var mode = state.mode;
+    var isCopy = !!opts.saveAs;
+    var deleteOld = false;
+    source.saving = true;
     try {
-      var renamed = name !== oldName;
-      await FS.write(state.postsDir, name, text);
-      if (renamed && !p.isNew) {
-        var ok = await openModal({
-          title: '文件名已修改',
-          body: '<p class="tip">已写入 <code>' + escapeHtml(name) + '</code>。<br>要删除旧文件 <code>' +
-            escapeHtml(oldName) + '</code> 吗？（不删除会出现两篇重复文章）</p>',
-          actions: [{ label: '保留旧文件', value: false }, { label: '删除旧文件', primary: true, value: true, danger: true }]
-        });
-        if (ok) {
-          try { await FS.remove(oldName); } catch (e) { toast('删除旧文件失败：' + e.message, 'err'); }
+      if (mode === 'fs') {
+        var target = await FS.parent(baseDir, targetPath);
+        var existing = null;
+        try { existing = await target.dir.getFileHandle(target.name); }
+        catch (e) {
+          if (e.name !== 'NotFoundError' && !/^NotFoundError/.test(e.message || '')) throw e;
+        }
+        var sameFile = !isCopy && !source.isNew && targetPath === oldPath;
+        if (!sameFile && !isCopy && !source.isNew && existing && source.handle && existing.isSameEntry) {
+          sameFile = await existing.isSameEntry(source.handle);
+        }
+        if (existing && !sameFile) {
+          var pendingTarget = state.posts.find(function (x) { return x !== source && x.path === targetPath && x.dirty; });
+          if (pendingTarget) { toast('目标文章有未保存修改，请先保存它或使用其他文件名', 'err'); return; }
+          var overwrite = await openModal({
+            title: '文件已存在',
+            body: '<p class="tip">覆盖 <code>' + escapeHtml(targetPath) + '</code> 会替换其现有内容。</p>',
+            actions: [{ label: '取消', value: false }, { label: '覆盖文件', primary: true, danger: true, value: true }]
+          });
+          if (!overwrite) return;
         }
       }
+      if (mode === 'fs' && !isCopy && !source.isNew && targetPath !== oldPath && !sameFile) {
+        var choice = await openModal({
+          title: '文件名已修改',
+          body: '<p class="tip">将保存到 <code>' + escapeHtml(targetPath) + '</code>。是否删除旧文件 <code>' +
+            escapeHtml(oldPath) + '</code>？保留旧文件时，新文章会重新生成短链。</p>',
+          actions: [{ label: '取消', value: null }, { label: '保留旧文件', value: 'copy' },
+            { label: '删除旧文件', primary: true, danger: true, value: 'move' }]
+        });
+        if (!choice) return;
+        isCopy = choice === 'copy';
+        deleteOld = choice === 'move';
+      }
+      var checkedSource = source.raw;
+      if (mode === 'fs' && !source.isNew && (sameFile || deleteOld)) {
+        checkedSource = await diskTextAt(baseDir, oldPath);
+        if (checkedSource !== source.raw && checkedSource !== sourceText) {
+          if (!await confirmDiskChange(source, checkedSource, sourceText)) return false;
+          if (await diskTextAt(baseDir, oldPath) !== checkedSource) {
+            toast('文件再次变化，请重新保存并核对版本', 'err'); return false;
+          }
+        }
+      }
+      var p = source;
+      var text = sourceText;
+      if (isCopy) {
+        var copyDoc = independentCopy(sourceText);
+        text = Core.stringifyPost(copyDoc);
+        p = { id: uid(), projectId: projectId, doc: copyDoc, path: targetPath, name: name,
+          raw: '', dirty: false, isNew: true, savedOnce: false, handle: null };
+      }
+      var needsLinkCheck = p.isNew || (p.raw && linkFor(Core.parsePost(p.raw)) !== linkFor(p.doc));
+      if (needsLinkCheck && state.posts.some(function (other) {
+        return other !== p && other.path !== targetPath && linkFor(other.doc) === linkFor(p.doc);
+      })) {
+        toast('文章短链将与已有文章重复，请修改标题或设置独立短链', 'err'); return false;
+      }
+      var fh = mode === 'fs' ? await FS.write(baseDir, targetPath, text) : null;
+      if (mode !== 'fs') downloadBlob(text, name);
+      var removeError = null;
+      if (deleteOld) {
+        try {
+          var latest = await diskTextAt(baseDir, oldPath);
+          if (latest !== null && latest !== checkedSource) throw new Error('原文件刚被修改，已保留');
+          if (latest !== null) await FS.remove(oldPath, baseDir);
+        } catch (e) { removeError = e; }
+      }
+      var stillCurrent = state.current === source;
+      var changed = !isCopy && (Core.stringifyPost(source.doc) !== sourceText ||
+        (stillCurrent ? form.fileName.value !== requestedName :
+          !!source.pendingName && source.pendingName !== requestedName));
       p.name = name;
-      p.path = name;
+      p.path = targetPath;
       p.raw = text;
+      p.handle = fh;
       p.isNew = false;
       p.savedOnce = true;
-      p.dirty = false;
-      clearDraft(p);
-      await FS.loadAll();
-      var again = state.posts.find(function (x) { return x.name === name; });
-      if (again) openPost(again, { skipDraftCheck: true });
-      else { updateDirtyUI(); applyLocks(); renderFrontMatter(); renderList(); }
-      toast('已保存 ' + name, 'ok');
+      p.dirty = changed;
+      if (!changed) { p.doc = Core.parsePost(text); p.pendingName = null; }
+      if (!isCopy) {
+        try { localStorage.removeItem(oldKey); } catch (e) {}
+        if (!changed) clearDraft(p);
+        else saveDraft(p);
+      }
+      if (state.projectId === projectId) {
+        state.posts = state.posts.filter(function (x) { return x === p || x.path !== targetPath; });
+        if (state.posts.indexOf(p) === -1) state.posts.unshift(p);
+        if (removeError) await FS.loadAll();
+        if (isCopy && stillCurrent && Core.stringifyPost(source.doc) === sourceText && form.fileName.value === requestedName) {
+          source.pendingName = null;
+          form.fileName.value = source.name;
+          openPost(p, { skipDraftCheck: true });
+        } else if (!isCopy && stillCurrent) {
+          if (!changed) form.fileName.value = name;
+          applyLocks(); updateDirtyUI(); renderFrontMatter();
+        }
+        reindex();
+      }
+      if (removeError) toast('新文件已保存，但删除旧文件失败：' + removeError.message, 'err');
+      else toast((mode === 'fs' ? '已保存 ' : '已下载 ') + name + (changed ? '，后续修改仍未保存' : ''), 'ok');
+      return true;
     } catch (e) {
       console.error(e);
       toast('保存失败：' + e.message, 'err');
-    }
+      return false;
+    } finally { source.saving = false; }
   }
 
   async function newPost() {
@@ -1946,8 +2264,10 @@
     Core.set(doc, 'date', Core.formatDateTime(now));
 
     var name = Core.suggestFilename(title, now, 'yy');
+    name = unusedName(name);
     var p = {
       id: uid(),
+      projectId: state.projectId,
       path: name,
       name: name,
       doc: doc,
@@ -1960,17 +2280,19 @@
     state.posts.unshift(p);
     openPost(p);
     form.fileName.select();
-    toast('日期与 abbrlink 已锁定：保存后日期解锁，hexo generate 后 abbrlink 解锁');
+    saveDraft(p);
+    toast(state.mode === 'demo' ? '正在临时写作，保存会下载 Markdown 文件' :
+      '日期与 abbrlink 已锁定：保存后日期解锁，hexo generate 后 abbrlink 解锁');
   }
 
   async function duplicatePost() {
     var p = state.current;
     if (!p) return;
     var text = currentText();
-    var name = p.name.replace(/\.md$/i, '') + ' 副本.md';
-    var doc = Core.parsePost(text, { isNew: true });
+    var name = unusedName(p.name.replace(/\.md$/i, '') + ' 副本.md');
+    var doc = independentCopy(text);
     var copy = {
-      id: uid(), path: name, name: name, doc: doc, raw: '',
+      id: uid(), projectId: state.projectId, path: siblingPath(p, name), name: name, doc: doc, raw: '',
       handle: null, dirty: true, savedOnce: false, isNew: true
     };
     state.posts.unshift(copy);
@@ -1978,21 +2300,31 @@
     toast('已复制为新文章，保存后才会写入磁盘');
   }
 
+  function unusedName(name) {
+    var base = name.replace(/\.md$/i, ''), candidate = name, n = 2;
+    while (state.posts.some(function (p) { return p.name === candidate; })) candidate = base + ' (' + (n++) + ').md';
+    return candidate;
+  }
+
   async function deletePost() {
     var p = state.current;
     if (!p) return;
+    if (p.saving) { toast('文章正在保存，请完成后再删除', 'err'); return; }
+    var baseDir = state.postsDir, projectId = state.projectId, mode = state.mode;
     var ok = await openModal({
       title: '删除文章',
-      body: '<p class="tip">确定删除 <code>' + escapeHtml(p.name) + '</code> 吗？' +
+      body: '<p class="tip">确定删除 <code>' + escapeHtml(p.path) + '</code> 吗？' +
         (state.mode === 'fs' ? '文件会从磁盘移除。' : '仅从当前列表移除。') + '</p>',
       actions: [{ label: '取消', value: false }, { label: '删除', primary: true, danger: true, value: true }]
     });
     if (!ok) return;
     try {
-      if (state.mode === 'fs' && !p.isNew) await FS.remove(p.name);
+      if (mode === 'fs' && !p.isNew) await FS.remove(p.path, baseDir);
+      if (projectId !== state.projectId) { clearDraft(p); return; }
       state.posts = state.posts.filter(function (x) { return x.id !== p.id; });
+      p.dirty = false;
       clearDraft(p);
-      closeEditor();
+      if (state.current === p) closeEditor();
       reindex();
       toast('已删除');
     } catch (e) {
@@ -2003,6 +2335,43 @@
   /* ================================================================
    * 13. 导入模式（无 File System Access API）
    * ================================================================ */
+  // 目录导入只提供相对路径。即使目录名和内容相同，也不能据此自动关联草稿。
+  async function chooseImportProject(posts, rootName) {
+    var groups = new Map();
+    try {
+      Object.keys(localStorage).forEach(function (key) {
+        var match = /^hexo-editor:draft:v2:(files-[^:]+):/.exec(key);
+        if (!match) return;
+        var draft;
+        try { draft = JSON.parse(localStorage.getItem(key)); } catch (e) { return; }
+        if (!draft || typeof draft.text !== 'string') return;
+        var samePath = posts.find(function (p) { return p.path === draft.path; });
+        if (draft.importRoot !== rootName && !samePath && !(draft.isNew && !draft.importRoot)) return;
+        var group = groups.get(match[1]) || { count: 0, at: 0, matches: 0, names: [] };
+        group.count++;
+        group.at = Math.max(group.at, draft.at || 0);
+        if (samePath && samePath.raw === draft.baseRaw) group.matches++;
+        group.names.push(draft.pendingName || draft.name || draft.path);
+        groups.set(match[1], group);
+      });
+    } catch (e) { /* 无本地存储时仍可导入和下载 */ }
+    if (!groups.size) return 'files-' + uid();
+    var select = el('select', {'aria-label': '历史导入记录'});
+    Array.from(groups.entries()).sort(function (a,b) {
+      return b[1].matches - a[1].matches || b[1].at - a[1].at;
+    }).forEach(function (item) {
+      var g = item[1];
+      select.appendChild(el('option', {value:item[0], text:new Date(g.at).toLocaleString() +
+        ' · ' + g.count + ' 份草稿 · ' + g.names.slice(0, 2).join('、') + ' · ' + g.matches + ' 篇原文一致'}));
+    });
+    var choice = await openModal({title:'关联导入目录的草稿', enterConfirm:false,
+      body:el('div', {}, [el('p', {text:'请选择属于当前目录「' + rootName +
+        '」的历史记录。若是其他博客，请作为新项目打开。'}), select]),
+      actions:[{label:'作为新项目打开', value:'new'}, {label:'使用所选草稿记录', primary:true, value:'use'}]});
+    if (!choice) return null;
+    return choice === 'use' ? select.value : 'files-' + uid();
+  }
+
   function importFolder() {
     var input = el('input', { type: 'file', multiple: true, webkitdirectory: '', directory: '', style: 'display:none' });
     document.body.appendChild(input);
@@ -2014,7 +2383,7 @@
       for (var i = 0; i < files.length; i++) {
         var f = files[i];
         if (!/\.md$/i.test(f.name)) continue;
-        var raw = await f.text();
+        var raw = await readPostFile(f);
         var doc = Core.parsePost(raw);
         posts.push({
           id: uid(), path: f.webkitRelativePath || f.name, name: f.name,
@@ -2022,8 +2391,17 @@
         });
       }
       if (!posts.length) { toast('这个文件夹里没有 .md 文件', 'err'); return; }
+      commitCurrentDraft();
+      var rootName = posts[0].path.split('/')[0];
+      var projectId = await chooseImportProject(posts, rootName);
+      if (!projectId) return;
       state.mode = 'files';
+      state.projectId = projectId;
+      state.importRoot = rootName;
+      state.imagesDir = null; state.hasImages = false; resetImageCache();
+      posts.forEach(function (p) { p.projectId = state.projectId; });
       state.posts = posts;
+      discoverDrafts();
       state.current = null;
       reindex();
       updateModeUI();
@@ -2051,7 +2429,7 @@
 
   /** 主区三种状态：未连目录→欢迎页；连了但没选文章→灰掉的编辑器；选了→正常编辑 */
   function refreshMainView() {
-    var connected = state.mode === 'fs' || state.mode === 'files';
+    var connected = state.mode === 'fs' || state.mode === 'files' || state.posts.length > 0;
     var idle = connected && !state.current;
 
     $('#empty').classList.toggle('hidden', connected);
@@ -2224,6 +2602,10 @@
         } else {
           state.imagesRemembered = null;
           state.imagesDir = h;
+          state.imagesSource = 'manual';
+          state.imagesScope = state.mode === 'fs' ? state.projectId : null;
+          resetImageCache();
+          await idb.set('imagesScope', state.imagesScope);
           state.hasImages = true;
         }
         toast('已重新授权', 'ok');
@@ -2238,6 +2620,7 @@
     render();
 
     var actions = [];
+    if (legacyDrafts().length) actions.push({ label: '导入旧版草稿', value: 'legacy' });
     if (!hasFSA) actions.push({ label: '导入文件夹', value: 'import' });
     actions.push({ label: '进入编辑器', primary: true, value: true });
 
@@ -2248,6 +2631,7 @@
       actions: actions
     }).then(function (v) {
       if (v === 'import') importFolder();
+      if (v === 'legacy') importLegacyDrafts();
       return v;
     });
   }
@@ -2357,14 +2741,21 @@
     };
     form.description.oninput = function () { setField('description', form.description.value); };
     form.cover.oninput = function () {
+      if (state.current) coverImports.delete(state.current);
       setField('cover', form.cover.value.trim());
       updateCoverPreview();
     };
     form.abbrlink.oninput = function () { setField('abbrlink', form.abbrlink.value.trim()); };
     form.date.oninput = function () {
       var v = form.date.value.trim();
-      if (v && !Core.parseDate(v)) { form.date.classList.add('invalid'); }
-      else { form.date.classList.remove('invalid'); setField('date', v); }
+      if (v && !Core.parseDate(v)) {
+        // 格式暂不合法：标红提示，但不静默丢弃——原始输入照样写进 doc，
+        // 保证「表单显示的」与「保存的」一致，不会出现「改了却没保存」的错觉。
+        form.date.classList.add('invalid');
+      } else {
+        form.date.classList.remove('invalid');
+      }
+      setField('date', v);
     };
     form.date.onblur = function () {
       var v = form.date.value.trim();
@@ -2373,8 +2764,9 @@
         var normalized = Core.hasTimePart(v) ? Core.formatDateTime(d) : Core.formatDate(d);
         form.date.value = normalized;
         setField('date', normalized);
+        form.date.classList.remove('invalid');
       }
-      form.date.classList.remove('invalid');
+      // 格式不合法时保留红框：输入还没被接受，不能把警告悄悄擦掉
     };
 
     /* --- 标签输入 --- */
@@ -2418,22 +2810,37 @@
     };
 
     /* --- 封面 --- */
+    var coverImports = new WeakMap();
+    async function applyCoverFile(file, owner) {
+      if (!owner || state.current !== owner || !file || !/^image\//.test(file.type)) return;
+      var ticket = {};
+      coverImports.set(owner, ticket);
+      var path = await importImage(file);
+      if (!path || coverImports.get(owner) !== ticket || !state.posts.includes(owner)) return;
+      if (state.current === owner) {
+        form.cover.value = path;
+        setField('cover', path);
+        updateCoverPreview();
+      } else {
+        Core.set(owner.doc, 'cover', path);
+        owner.dirty = true;
+        saveDraft(owner);
+        renderList();
+      }
+    }
     $('#btn-cover-pick').onclick = function () {
+      var owner = state.current;
       var input = el('input', { type: 'file', accept: 'image/*', style: 'display:none' });
       document.body.appendChild(input);
       input.onchange = async function () {
         var file = input.files && input.files[0];
         input.remove();
-        if (!file) return;
-        var path = await importImage(file);
-        if (!path) return;
-        form.cover.value = path;
-        setField('cover', path);
-        updateCoverPreview();
+        await applyCoverFile(file, owner);
       };
       input.click();
     };
     $('#btn-cover-clear').onclick = function () {
+      if (state.current) coverImports.delete(state.current);
       form.cover.value = '';
       setField('cover', '');
       updateCoverPreview();
@@ -2441,13 +2848,9 @@
     $('#cover-preview').addEventListener('dragover', function (e) { e.preventDefault(); });
     $('#cover-preview').addEventListener('drop', async function (e) {
       e.preventDefault();
-      var file = e.dataTransfer.files && e.dataTransfer.files[0];
-      if (!file) return;
-      var path = await importImage(file);
-      if (!path) return;
-      form.cover.value = path;
-      setField('cover', path);
-      updateCoverPreview();
+      e.stopPropagation();
+      dragDepth = 0; dropHint.classList.remove('on');
+      await applyCoverFile(e.dataTransfer.files[0], state.current);
     });
 
     /* --- 预估 abbrlink --- */
@@ -2473,7 +2876,15 @@
     };
 
     /* --- 属性区折叠 / front matter --- */
+    $('#btn-mobile-props').onclick = function () {
+      var shown = $('.ed-body').classList.toggle('mobile-props');
+      this.setAttribute('aria-expanded', String(shown));
+      this.textContent = shown ? '正文' : '属性';
+    };
     $('#btn-props-toggle').onclick = function () {
+      if (window.matchMedia && window.matchMedia('(max-width: 860px)').matches) {
+        $('#btn-mobile-props').click(); return;
+      }
       var body = $('.ed-body');
       body.classList.toggle('no-props');
       this.textContent = body.classList.contains('no-props') ? '展开' : '收起';
@@ -2491,19 +2902,8 @@
       if (!p) return;
       var name = await promptText('另存为', '文件名', p.name.replace(/\.md$/i, ' 副本.md'));
       if (!name) return;
-      var text = currentText();
-      if (state.mode === 'fs') {
-        try {
-          await FS.write(state.postsDir, name, text);
-          await FS.loadAll();
-          var again = state.posts.find(function (x) { return x.name === name; });
-          if (again) openPost(again);
-          toast('已另存为 ' + name, 'ok');
-        } catch (e) { toast('另存失败：' + e.message, 'err'); }
-      } else {
-        downloadBlob(text, name);
-        toast('已下载 ' + name, 'ok');
-      }
+      if (state.current !== p) return;
+      await savePost({ saveAs: true, name: name });
     };
     $('#btn-dup').onclick = duplicatePost;
     $('#btn-delete').onclick = deletePost;
@@ -2536,7 +2936,16 @@
     form.fileName.onchange = function () {
       if (!state.current) return;
       var v = form.fileName.value.trim();
-      if (v === state.current.name) return;
+      if (v === state.current.name) {
+        state.current.pendingName = null;
+        if (!state.current.isNew && currentText() === state.current.raw) {
+          state.current.dirty = false;
+          clearDraft(state.current);
+          renderList(); updateDirtyUI();
+        } else if (state.current.dirty) saveDraft();
+        return;
+      }
+      state.current.pendingName = v;
       markDirty();
     };
 
@@ -2557,12 +2966,14 @@
       e.preventDefault();
       dragDepth = 0;
       dropHint.classList.remove('on');
-      if (!state.current) return;
+      var owner = state.current;
+      if (!owner || !$('#md-pane').contains(e.target)) return;
       var files = Array.prototype.slice.call((e.dataTransfer && e.dataTransfer.files) || []);
       var images = files.filter(function (f) { return /^image\//.test(f.type); });
       if (!images.length) return;
       for (var i = 0; i < images.length; i++) {
         var path = await importImage(images[i]);
+        if (state.current !== owner) return;
         if (path) insertBlock('![](' + path + ')', true);
       }
     });
@@ -2572,14 +2983,16 @@
       var mod = e.ctrlKey || e.metaKey;
       if (!mod) return;
       var k = e.key.toLowerCase();
+      if (e.isComposing || composing || !$('#modal').classList.contains('hidden')) return;
       if (k === 's') { e.preventDefault(); savePost(); }
+      else if (k === 'n' && e.shiftKey) { e.preventDefault(); newPost(); }
+      else if (!bodyEl.contains(e.target) && e.target !== bodyEl) return;
       else if (k === 'b') { e.preventDefault(); action('bold'); }
       else if (k === 'i') { e.preventDefault(); action('italic'); }
       else if (k === 'k') { e.preventDefault(); action('link'); }
       else if (k === '2') { e.preventDefault(); action('h2'); }
       else if (k === '3') { e.preventDefault(); action('h3'); }
       else if (k === '4') { e.preventDefault(); action('h4'); }
-      else if (k === 'n' && e.shiftKey) { e.preventDefault(); newPost(); }
     });
 
     window.addEventListener('beforeunload', function (e) {
@@ -2608,6 +3021,8 @@
           var ip = await imgHandle.queryPermission({ mode: 'readwrite' });
           if (ip === 'granted') {
             state.imagesDir = imgHandle;
+            state.imagesSource = 'manual';
+            state.imagesScope = await idb.get('imagesScope');
             state.hasImages = true;
           } else {
             state.imagesRemembered = imgHandle; // 记住了，但这次要补一次授权
@@ -2633,13 +3048,21 @@
     }
 
     updateModeUI();
+    if (state.mode === 'demo') {
+      discoverDrafts();
+      if (state.posts.length) { reindex(); refreshMainView(); }
+    }
     if (restored) toast('已从浏览器缓存恢复上次的目录', 'ok');
 
     // 两个目录都连好就静默进入；第一次打开、或有目录没连上才弹引导
     maybeOpenDirGuide();
+    state.booted = true;
   }
 
+  var bootStarted = false;
   document.addEventListener('DOMContentLoaded', function () {
+    if (bootStarted) return;
+    bootStarted = true;
     cacheForm();
     boot();
   });
@@ -2670,6 +3093,9 @@
     wrap: wrap,
     prefixLines: prefixLines,
     currentText: currentText,
+    draftKey: draftKey,
+    discoverDrafts: discoverDrafts,
+    importLegacyDrafts: importLegacyDrafts,
     /* 正文（contenteditable）相关的测试钩子 */
     getBody: bodyText,
     setBody: function (text) {
@@ -2706,7 +3132,7 @@
       opts = opts || {};
       var doc = Core.parsePost(raw, { isNew: !!opts.isNew });
       var p = {
-        id: uid(), path: name, name: name, doc: doc, raw: raw, handle: null,
+        id: uid(), projectId: state.projectId, path: name, name: name, doc: doc, raw: raw, handle: null,
         dirty: !!opts.dirty, savedOnce: !opts.isNew, isNew: !!opts.isNew
       };
       state.posts.unshift(p);

@@ -1,3 +1,4 @@
+import { findPostsDir, listPosts, readPost, waitForBoot } from './helpers.mjs';
 // UI 集成测试：用 jsdom 真正加载 index.html + 三个脚本，模拟用户在界面上的操作
 // 用法：node hexo-editor/test/ui.test.mjs
 import fs from 'node:fs';
@@ -6,11 +7,12 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { JSDOM } = require('D:/ZEROKAMI/node_modules/jsdom');
+const { JSDOM } = require('jsdom');
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const editorDir = path.resolve(here, '..');
-const postsDir = path.resolve(here, '../../source/_posts');
+
+const postsDir = findPostsDir(here);
 
 let checks = 0;
 let failed = 0;
@@ -23,7 +25,7 @@ function check(ok, label, extra) {
 }
 
 /** 启动一个 DOM 实例（每个用例独立，避免状态串味） */
-function boot() {
+async function boot() {
   const html = fs.readFileSync(path.join(editorDir, 'index.html'), 'utf8')
     // 去掉外链脚本，改成手动注入，保证顺序可控
     .replace(/<script src="assets\/[^"]+"><\/script>/g, '');
@@ -43,7 +45,7 @@ function boot() {
     const code = fs.readFileSync(path.join(editorDir, 'assets', file), 'utf8');
     w.eval(code);
   }
-  w.document.dispatchEvent(new w.Event('DOMContentLoaded'));
+  await waitForBoot(dom);
   return dom;
 }
 
@@ -55,7 +57,7 @@ function sleep(ms) {
  * 用例 1：启动后空态、按钮存在
  * ================================================================ */
 {
-  const dom = boot();
+  const dom = await boot();
   const d = dom.window.document;
   check(!!d.querySelector('#empty'), '空态可见');
   check(d.querySelector('#editor').classList.contains('hidden'), '编辑器初始隐藏');
@@ -96,14 +98,20 @@ function sleep(ms) {
 /* ================================================================
  * 用例 2：模拟导入模式打开一篇文章（绕过 File System Access）
  * ================================================================ */
-const rawSamples = {
-  '25 迈从G3 A鼠标开箱.md': fs.readFileSync(path.join(postsDir, '25 迈从G3 A鼠标开箱.md'), 'utf8'),
-  '26 半高SATA硬盘盒开箱.md': fs.readFileSync(path.join(postsDir, '26 半高SATA硬盘盒开箱.md'), 'utf8'),
-  '25【初音ミク MMD】スターナイトスノウ 星夜之雪 (YYB式初音ミク).md': fs.readFileSync(
-    path.join(postsDir, '25【初音ミク MMD】スターナイトスノウ 星夜之雪 (YYB式初音ミク).md'), 'utf8')
-};
+// 从语料里取 3 篇：一篇同时含 B 站与 YouTube 视频块，另两篇任意。
+// 不绑定具体文件名，内置 fixtures 与真实博客目录都能跑。
+const allNames = listPosts(postsDir);
+const videoName = allNames.find((n) => {
+  const raw = readPost(postsDir, n);
+  return raw.includes('player.bilibili.com') && raw.includes('youtube.com/embed');
+});
+if (!videoName) throw new Error('语料里没有同时含 B 站与 YouTube 地址的视频文章');
+const rawSamples = {};
+for (const name of [videoName].concat(allNames.filter((n) => n !== videoName).slice(0, 2))) {
+  rawSamples[name] = readPost(postsDir, name);
+}
 
-const dom = boot();
+const dom = await boot();
 const w = dom.window;
 const d = w.document;
 const Core = w.HexoCore;
@@ -149,7 +157,7 @@ check(acts.length >= 25, `工具栏按钮数量 ${acts.length} >= 25`);
 });
 
 /* --- 2c. 视频文章正文保留播放器地址（B 站 / YouTube） --- */
-const videoPost = rawSamples['25【初音ミク MMD】スターナイトスノウ 星夜之雪 (YYB式初音ミク).md'];
+const videoPost = rawSamples[videoName];
 const splitV = Core.splitFront(videoPost);
 check(splitV.body.includes('player.bilibili.com'), '视频文章正文含 B 站地址');
 check(splitV.body.includes('youtube.com/embed'), '视频文章正文含 YouTube 地址');
@@ -167,7 +175,7 @@ dom.window.close();
  * 用例 3：编辑交互（在 DOM 上真的改值再读回）
  * ================================================================ */
 {
-  const dom2 = boot();
+  const dom2 = await boot();
   const w2 = dom2.window;
   const d2 = w2.document;
   // 取消 disabled 以便输入（真实场景里目录打开之前用户也点不到这些框）

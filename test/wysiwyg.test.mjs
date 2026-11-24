@@ -1,3 +1,4 @@
+import { findPostsDir, pickPost, waitForBoot } from './helpers.mjs';
 // 所见即所得编辑层：正文 DOM 往返必须逐字节不变 + 块级识别 + 回车/退格/撤销
 // 用法：node hexo-editor/test/wysiwyg.test.mjs
 import fs from 'node:fs';
@@ -6,11 +7,12 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { JSDOM } = require('D:/ZEROKAMI/node_modules/jsdom');
+const { JSDOM } = require('jsdom');
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const editorDir = path.resolve(here, '..');
-const postsDir = path.resolve(here, '../../source/_posts');
+
+const postsDir = findPostsDir(here);
 
 let checks = 0;
 let failed = 0;
@@ -38,7 +40,7 @@ w.indexedDB = undefined;
 for (const f of ['core.js', 'app.js']) {
   w.eval(fs.readFileSync(path.join(editorDir, 'assets', f), 'utf8'));
 }
-d.dispatchEvent(new w.Event('DOMContentLoaded'));
+await waitForBoot(dom);
 
 const E = w.HexoEditor;
 const Core = w.HexoCore;
@@ -165,8 +167,9 @@ function key(k) {
  * 7. 保存路径：改一个字后存出来，只有那一处变化
  * ================================================================ */
 {
-  const raw = fs.readFileSync(path.join(postsDir, '26 半高SATA硬盘盒开箱.md'), 'utf8');
-  E.loadFromText('26 半高SATA硬盘盒开箱.md', raw, {});
+  const sample = pickPost(postsDir, null, '任意一篇文章');
+  const raw = sample.raw;
+  E.loadFromText(sample.name, raw, {});
   E.setBody(E.getBody() + '\n\n新增一行');
   const out = E.currentText();
   check(out.startsWith(raw), '改动后 front matter 与原文逐字节相同');

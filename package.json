@@ -1,0 +1,16 @@
+{
+  "name": "hexo-editor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Static Hexo post editor; Node dependencies are for testing only.",
+  "scripts": {
+    "test": "node test/run.mjs",
+    "test:fixtures": "node test/run.mjs --fixtures"
+  },
+  "engines": { "node": ">=18" },
+  "devDependencies": {
+    "hexo-abbrlink": "2.2.1",
+    "js-yaml": "4.1.0",
+    "jsdom": "20.0.3"
+  }
+}

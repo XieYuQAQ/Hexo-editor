@@ -52,6 +52,7 @@
     if (!value) return null;
     var m = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?\s*$/.exec(String(value).trim());
     if (!m) return null;
+    if (Number(m[4] || 0) > 23 || Number(m[5] || 0) > 59 || Number(m[6] || 0) > 59) return null;
     var d = new Date(
       Number(m[1]), Number(m[2]) - 1, Number(m[3]),
       m[4] ? Number(m[4]) : 0,
@@ -98,6 +99,10 @@
     if (/^[-?:,[\]{}#&*!|>'"%@`]/.test(s)) return false;
     if (/: |:$| #/.test(s)) return false;
     if (/[\n\r\t]/.test(s)) return false;
+    if (/[,[\]{}]/.test(s)) return false;
+    // YAML 的隐式类型必须引用，字符串字段不能变成布尔、数字或日期。
+    if (/^(?:null|true|false|yes|no|on|off|y|n|~)$/i.test(s)) return false;
+    if (/^[+-]?(?:\d|\.\d|\.inf$|\.nan$)/i.test(s)) return false;
     return true;
   }
 
@@ -105,6 +110,7 @@
   function formatScalar(s) {
     s = s == null ? '' : String(s);
     if (s === '') return '';
+    if (/[\n\r\t\u0000-\u001f]/.test(s)) return JSON.stringify(s);
     if (isPlainSafe(s)) return s;
     return "'" + s.replace(/'/g, "''") + "'";
   }
@@ -182,7 +188,7 @@
       if (/^\[.*\]\s*$/.test(inline.trim())) {
         var inner = inline.trim().slice(1, -1).trim();
         if (!inner) return [];
-        return inner.split(',').map(function (t) {
+        return splitFlowItems(inner).map(function (t) {
           return unquote(t);
         }).filter(function (t) {
           return t !== '';
@@ -211,6 +217,24 @@
 
     // title / abbrlink / cover / date / author / updated ...
     return unquote(inline);
+  }
+
+  /** 流式标签列表里的引号和转义逗号，不是标签分隔符。 */
+  function splitFlowItems(text) {
+    var items = [], start = 0, quote = '';
+    for (var i = 0; i < text.length; i++) {
+      var c = text.charAt(i);
+      if (quote) {
+        if (quote === '"' && c === '\\') { i++; continue; }
+        if (c === quote) {
+          if (quote === "'" && text.charAt(i + 1) === "'") i++;
+          else quote = '';
+        }
+      } else if ((c === '"' || c === "'") && text.slice(start, i).trim() === '') quote = c;
+      else if (c === ',') { items.push(text.slice(start, i)); start = i + 1; }
+    }
+    items.push(text.slice(start));
+    return items;
   }
 
   /* ------------------------------------------------------------------ *
@@ -242,10 +266,17 @@
       eol: split.eol,
       hasFront: split.hasFront,
       raw: raw,
+      bom: String(raw || '').charAt(0) === '\uFEFF' ? '\uFEFF' : '',
+      frontPrefix: [],
       isNew: !!opts.isNew
     };
 
     var blocks = split.hasFront ? splitBlocks(split.front) : [];
+    if (split.hasFront) {
+      for (var i = 0; i < split.front.length && !KEY_RE.test(split.front[i]); i++) {
+        doc.frontPrefix.push(split.front[i]);
+      }
+    }
     doc.present = {};
     blocks.forEach(function (block) {
       if (doc.keyOrder.indexOf(block.key) === -1) doc.keyOrder.push(block.key);
@@ -292,14 +323,9 @@
       f = doc.fields[key] = { value: value, touched: true, raw: null };
     }
     var same = JSON.stringify(f.value) === JSON.stringify(value);
-    if (!f.touched && same) return doc;
-    if (f.raw && same) {
-      // 值没变，保持原样回写
-      f.touched = false;
-      return doc;
-    }
+    if (same) return doc;
     f.value = value;
-    f.touched = true;
+    f.touched = !f.raw || JSON.stringify(readBlock({ key: key, lines: f.raw })) !== JSON.stringify(value);
     return doc;
   }
 
@@ -369,7 +395,7 @@
    */
   function stringifyPost(doc) {
     var eol = doc.eol || '\n';
-    var out = [];
+    var out = (doc.frontPrefix || []).slice();
     orderedKeys(doc).forEach(function (key) {
       var lines = isKnown(key) ? emitField(doc, key) : doc.unknown[key];
       (lines || []).forEach(function (l) {
@@ -377,8 +403,8 @@
       });
     });
     var head = ['---'].concat(out).concat(['---']).join(eol);
-    if (doc.body === '' || doc.body == null) return head + eol;
-    return head + eol + doc.body;
+    if (doc.body === '' || doc.body == null) return (doc.bom || '') + head + eol;
+    return (doc.bom || '') + head + eol + doc.body;
   }
 
   /** 新建空文档 */
@@ -565,6 +591,7 @@
    *   auto = true（默认）：用 checkGoogle() 判断网络，自动在哔哩哔哩 / YouTube 间选择；
    *   auto = false：不判断网络，只输出单一平台的播放器 iframe。
    */
+  var videoSequence = 0;
   function buildVideoBlock(opt) {
     opt = opt || {};
     var style = opt.style === 'simple' ? 'simple' : 'padded';
@@ -587,10 +614,12 @@
         lines.push(youtubeIframe(yt, style));
       }
     } else {
-      lines.push('<div id="videoContainer">');
+      var containerId = 'videoContainer-' + Date.now().toString(36) + '-' + (++videoSequence);
+      lines.push('<div id="' + containerId + '">');
       lines.push('  <p>请稍等，正在根据您的网络加载播放器……</p>');
       lines.push('</div>');
       lines.push('<script>');
+      lines.push('(function(container) {');
 
       if (video.bvid || video.aid) {
         lines.push('  function loadBilibiliVideo() {');
@@ -605,14 +634,15 @@
       lines.push('  checkGoogle().then(function(status) {');
       if (video.bvid || video.aid) {
         lines.push('  if (status === 0) {');
-        lines.push('        document.getElementById("videoContainer").innerHTML = loadBilibiliVideo();');
+        lines.push('        container.innerHTML = loadBilibiliVideo();');
         lines.push('  } else {');
-        lines.push('        document.getElementById("videoContainer").innerHTML = loadYouTubeVideo();');
+        lines.push('        container.innerHTML = loadYouTubeVideo();');
         lines.push('    }');
       } else {
-        lines.push('        document.getElementById("videoContainer").innerHTML = loadYouTubeVideo();');
+        lines.push('        container.innerHTML = loadYouTubeVideo();');
       }
       lines.push('  });');
+      lines.push('})(document.currentScript ? document.currentScript.previousElementSibling : document.getElementById("' + containerId + '"));');
       lines.push('</script>');
     }
 
